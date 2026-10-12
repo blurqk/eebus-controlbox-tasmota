@@ -1583,7 +1583,7 @@ void EebusTeardownLater(void) {
 }
 void EebusTeardownNow(void) {
   if (ESp->teardown) {
-    if (ESp->via_srv) { EebusSrvFree(); return; }   // Server-Verbindung komplett schliessen
+    if (ESp->via_srv) { EebusSrvFreeConn(); return; }   // Server-Verbindung komplett schliessen
     EebusShipFree();   //      (Socket + TLS + Slot-Unlink in einem)
   }
 }
@@ -1652,7 +1652,7 @@ int EebusStreamRead(uint8_t *buf, size_t n, uint32_t timeout_ms) {
 // opcode: 0x2=binary (SHIP/SPINE), 0xA=Pong.
 bool EebusWsSendOp(const uint8_t *payload, size_t len, uint8_t opcode) {
   if (ESp->via_srv) {   // Slot einer EINGEHENDEN Verbindung -> Server-Sendepfad
-    return EebusSrvWsSendOp(payload, len, opcode);   // (unmaskiert, ueber die BearSSL-Server-Engine)
+    return EebusSrvConnWsSendOp(payload, len, opcode);   // (unmaskiert, ueber die BearSSL-Server-Engine)
   }
   if (!ESp->client) { return false; }
   uint8_t hdr[14];
@@ -4381,7 +4381,7 @@ void EebusSmeDispatch(const uint8_t *rx, int n) {
 void EebusSmePoll(void) {
   if (ESp->via_srv) {   // Slot einer EINGEHENDEN Verbindung —
     if (ESp->teardown) {   // RX/Timeout macht das ESrv-Modul; nur ein
-      EebusSrvFree();   // von SPINE angeforderter Abbau landet hier
+      EebusSrvFreeConn();   // von SPINE angeforderter Abbau landet hier
     }   // (schliesst Socket + setzt Slot zurueck)
     return;
   }
@@ -5152,7 +5152,7 @@ void EebusDisconnectNow(void) {
    // ⚠️ Zaehler und Zeitpunkt der Vorfaelle bleiben ABSICHTLICH stehen — sie sind die Vorfallsliste.
   ESp->peer_hb_at = 0; ESp->peer_hb_ctr = 0; ESp->peer_hb_tmo_s = 0; ESp->peer_hb_lost = false;
   if (ESp->via_srv) {
-    EebusSrvFree();   // Server-Verbindung komplett schliessen (Socket+Unlink)
+    EebusSrvFreeConn();   // Server-Verbindung komplett schliessen (Socket+Unlink)
   } else if (ESp->client) {
     EebusTeardownLater();   // Freigabe verzoegert im sicheren Tick (nie sofort)
   } else {
@@ -5314,7 +5314,7 @@ void CmndEebusRole(void) {
       Eebus.advertised = false;   // erzwingt Neu-Ankuendigung mit neuem Typ (naechster Tick)
       mdns_service_remove("_ship", "_tcp");
       EebusMdnsAdvertise();
-      EebusSrvFree();   // aktive EINGEHENDE Verbindung trennen — der Peer dockt
+      EebusSrvFreeAll();   // aktive EINGEHENDE Verbindungen trennen — die Peers docken
    // neu an und liest Typ/UseCase-Actor der NEUEN Rolle
     }
   }
@@ -6236,7 +6236,43 @@ typedef struct {
    // Etappe 4: Verknuepfung mit einem EConn-Slot (SPINE-Datenphase)
   int      conn_idx = -1;   // Index in EConn[] (-1 = nicht verknuepft)
 } EebusSrvSlot;
-EebusSrvSlot ESrv;   // Etappe 1: EINE eingehende Verbindung
+// Mehrere eingehende Verbindungen gleichzeitig: frueher gab es nur EINEN Server-Slot. Seit
+// WARP4 und evcc beide von sich aus andocken, belegte die Wallbox den Slot und evcc wurde bei
+// jedem Versuch abgewiesen ("connection reset by peer"). Alle Server-Funktionen arbeiten
+// weiter auf "ESrv" = dem gerade gewaehlten Slot (wie ESp bei den SPINE-Slots).
+#define EEBUS_SRV_SLOTS  2
+EebusSrvSlot ESrvSlot[EEBUS_SRV_SLOTS];
+EebusSrvSlot *ESrvP = &ESrvSlot[0];
+#define ESrv (*ESrvP)
+
+// Server-Slot waehlen, der mit dem SPINE-Slot ESp verknuepft ist (false = keiner).
+bool EebusSrvSelectConn(void) {
+  int ci = ESp - EConn;
+  for (int i = 0; i < EEBUS_SRV_SLOTS; i++) {
+    if (ESrvSlot[i].conn_idx == ci) { ESrvP = &ESrvSlot[i]; return true; }
+  }
+  return false;
+}
+
+// Aufrufe aus dem SPINE-Kontext (ESp->via_srv). Der gewaehlte Server-Slot wird danach
+// zurueckgesetzt: diese Wege laufen auch mitten in der Pumpe EINES ANDEREN Server-Slots
+// (z.B. Heartbeat an alle Verbindungen), die danach mit ihrem eigenen ESrv weiterarbeitet.
+void EebusSrvFreeConn(void) {
+  EebusSrvSlot *keep = ESrvP;
+  if (EebusSrvSelectConn()) { EebusSrvFree(); }
+  ESrvP = keep;
+}
+bool EebusSrvConnWsSendOp(const uint8_t *payload, size_t len, uint8_t opcode) {
+  EebusSrvSlot *keep = ESrvP;
+  bool ok = EebusSrvSelectConn() && EebusSrvWsSendOp(payload, len, opcode);
+  ESrvP = keep;
+  return ok;
+}
+void EebusSrvFreeAll(void) {
+  EebusSrvSlot *keep = ESrvP;
+  for (int i = 0; i < EEBUS_SRV_SLOTS; i++) { ESrvP = &ESrvSlot[i]; EebusSrvFree(); }
+  ESrvP = keep;
+}
 
 void EebusSrvFree(void) {
   if (ESrv.conn_idx >= 0) {   // verknuepften SPINE-Slot zuruecksetzen
@@ -6282,8 +6318,9 @@ bool EebusSrvStart(void) {
   ESrv.deadline = millis() + EEBUS_SRV_TIMEOUT_MS;
 
   ESrv.sc   = (br_ssl_server_context*)malloc(sizeof(br_ssl_server_context));
-  ESrv.ibuf = (unsigned char*)malloc(EEBUS_SRV_IBUF);
-  ESrv.obuf = (unsigned char*)malloc(EEBUS_SRV_OBUF);
+   // TLS-Puffer in PSRAM: mit mehreren gleichzeitigen Server-Slots wuerden je ~19 KB DRAM fehlen
+  ESrv.ibuf = (unsigned char*)special_malloc(EEBUS_SRV_IBUF);
+  ESrv.obuf = (unsigned char*)special_malloc(EEBUS_SRV_OBUF);
   ESrv.cert_der = (uint8_t*)malloc(EEBUS_CERT_DER_SIZE);
   ESrv.abuf = (uint8_t*)special_malloc(EEBUS_SRV_ABUF);   // 32 KB -> PSRAM (DRAM schonen), wird wie bisher per free() freigegeben
   ESrv.abuf_len = 0;
@@ -6599,9 +6636,11 @@ void EebusSrvSmeHandle(int classifier, const char *json) {
   }
 
   if (strstr(json, "\"accessMethodsRequest\"")) {   // Geraet fragt UNSERE Kennung ab
+   // Wie im Client-Pfad: accessMethods.id = mDNS-id (eebus_adv_id). Hier stand noch die alte
+   // "Tasmota-EEBusGuard-<hostname>" -> evcc trennte jede eingehende Verbindung direkt nach dem
+   // Kennungs-Austausch, weil sie nicht zur mDNS-Ankuendigung passte.
     char reply[128];
-    snprintf_P(reply, sizeof(reply), PSTR("{\"accessMethods\":[{\"id\":\"Tasmota-EEBusGuard-%s\"}]}"),
-               TasmotaGlobal.hostname);
+    snprintf_P(reply, sizeof(reply), PSTR("{\"accessMethods\":[{\"id\":\"%s\"}]}"), eebus_adv_id);
     EebusSrvShipSendJson(reply);
     return;
   }
@@ -6841,19 +6880,28 @@ void EebusInboundAccept(void) {
   NetworkClient c = EebusInboundSrv->accept();
   if (c) {
     IPAddress rip = c.remoteIP();
-    if (ESrv.active) {
-      AddLog(LOG_LEVEL_INFO, PSTR("EBG: SRV eingehende Verbindung von %s abgewiesen (Slot belegt durch %s)"),
-             rip.toString().c_str(), ESrv.peer_ip);
+    int si = -1;
+    for (int i = 0; i < EEBUS_SRV_SLOTS; i++) {
+      if (!ESrvSlot[i].active) { si = i; break; }
+    }
+    if (si < 0) {
+      AddLog(LOG_LEVEL_INFO, PSTR("EBG: SRV eingehende Verbindung von %s abgewiesen (alle %d Server-Slots belegt: %s, %s)"),
+             rip.toString().c_str(), EEBUS_SRV_SLOTS, ESrvSlot[0].peer_ip, ESrvSlot[1].peer_ip);
       c.stop();
     } else {
+      ESrvP = &ESrvSlot[si];
       EebusSrvFree();   // Reste eines frueheren Versuchs abraeumen
       ESrv.sock = c;
       strlcpy(ESrv.peer_ip, rip.toString().c_str(), sizeof(ESrv.peer_ip));
-      AddLog(LOG_LEVEL_INFO, PSTR("EBG: *** SRV EINGEHENDE Verbindung von %s -> TLS-SERVER-Handshake ***"), ESrv.peer_ip);
+      AddLog(LOG_LEVEL_INFO, PSTR("EBG: *** SRV EINGEHENDE Verbindung von %s (Server-Slot %d) -> TLS-SERVER-Handshake ***"),
+             ESrv.peer_ip, si);
       if (!EebusSrvStart()) { EebusSrvFree(); }
     }
   }
-  EebusSrvPoll();
+  for (int i = 0; i < EEBUS_SRV_SLOTS; i++) {
+    ESrvP = &ESrvSlot[i];
+    EebusSrvPoll();
+  }
 }
 
 bool Xdrv126(uint32_t function) {

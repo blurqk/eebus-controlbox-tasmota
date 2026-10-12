@@ -815,6 +815,14 @@
   function doConnect(){
     if(needDevice()) return;
     var p = peers[selIdx];
+    // Ein Energiemanager (z.B. evcc) verbindet sich selbst. Ein zusaetzlicher Versuch von hier erzeugt eine
+    // Doppelverbindung; evcc behaelt dann unsere, bedient sie aber nicht mehr (kein Heartbeat, LPC-Timeout).
+    if((p.Type || '').toLowerCase().replace(/\s+/g, '').indexOf('energymanag') >= 0 &&
+       !confirm('Achtung HEMS: ' + (p.Brand ? p.Brand + ' ' : '') + (p.Model || '') +
+                ' verbindet sich selbstständig.\nSoll wirklich ein Verbindungsversuch unternommen werden?')) {
+      say('Verbinden abgebrochen — der Energiemanager verbindet sich selbst.');
+      return;
+    }
     say('Verbinde mit ' + (p.Model || maskSki(p.Ski)) + ' (' + p.Ip + ') …');
     cmd('EEBusConnect ' + p.Ski).then(function(r){
       say('Verbinde mit ' + (p.Model || '') + ' · ' + p.Ip + '\n' + JSON.stringify(r));
