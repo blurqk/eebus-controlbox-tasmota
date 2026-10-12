@@ -231,7 +231,7 @@
     <button data-p="connection" onclick="seite('connection')">Connection</button>
     <button data-p="settings" onclick="seite('settings')">Settings</button>
   </nav>
-  <a class="tasmota" href="/">Tasmota</a><span class="pill" id="ownrole">—</span></h1>
+  <a class="tasmota" href="/">Tasmota</a></h1>
 <div class="wrap">
 
   <!-- ===== EIGENE IDENTITAET =====
@@ -812,12 +812,19 @@
   // wird es erst, wenn EEBusConnect die SKI selbst versteht (wie EEBusLpc/EEBusLpp/EEBusRelease).
   // Ab Treiber-v133 nimmt EEBusConnect die SKI direkt entgegen — es gibt hier keine Listennummer
   // mehr, weder gespeichert noch gesendet. Damit kann kein Scan mehr dazwischenfunken.
+  // Ist das Geraet ein Energiemanager? Ab Treiber-v149 sagt das Geraet selbst, was gilt ("Mode" +
+  // "ModeSrc"). Aeltere Staende kennen das nicht — dann aus dem gemeldeten Typ ableiten. Dieselbe
+  // Pruefung fuer die Anzeige "Verbinden mit HEMS" und die Rueckfrage beim Verbinden.
+  function istHems(p){
+    if(p.ModeSrc && (p.Mode === 'hems' || p.Mode === 'steuve')) return p.Mode === 'hems';
+    return (p.Type || '').toLowerCase().replace(/\s+/g, '').indexOf('energymanag') >= 0;
+  }
   function doConnect(){
     if(needDevice()) return;
     var p = peers[selIdx];
     // Ein Energiemanager (z.B. evcc) verbindet sich selbst. Ein zusaetzlicher Versuch von hier erzeugt eine
     // Doppelverbindung; evcc behaelt dann unsere, bedient sie aber nicht mehr (kein Heartbeat, LPC-Timeout).
-    if((p.Type || '').toLowerCase().replace(/\s+/g, '').indexOf('energymanag') >= 0 &&
+    if(istHems(p) &&
        !confirm('Achtung HEMS: ' + (p.Brand ? p.Brand + ' ' : '') + (p.Model || '') +
                 ' verbindet sich selbstständig.\nSoll wirklich ein Verbindungsversuch unternommen werden?')) {
       say('Verbinden abgebrochen — der Energiemanager verbindet sich selbst.');
@@ -834,6 +841,15 @@
   function doDisconnect(){
     if(needDevice()) return;
     var p = peers[selIdx];
+    // Nach einem Trennen von hier wartet ein Energiemanager (evcc) lange, bevor er sich wieder
+    // verbindet — beobachtet: auch nach Minuten nicht, erst ein Neustart von evcc half.
+    if(istHems(p) &&
+       !confirm('Achtung HEMS: ' + (p.Brand ? p.Brand + ' ' : '') + (p.Model || '') +
+                ' verbindet sich selbstständig.\nNach dem Trennen kann es lange dauern, bis er sich wieder verbindet' +
+                ' (notfalls hilft nur ein Neustart des Energiemanagers).\nSoll die Verbindung wirklich getrennt werden?')) {
+      say('Trennen abgebrochen.');
+      return;
+    }
     cmd('EEBusDisconnect ' + p.Ski).then(function(j){ say(JSON.stringify(j)); setTimeout(refresh, 800); });
   }
 
@@ -847,10 +863,6 @@
       ucsLaden();
       if(slots.some(function(s){ return s.Sme === 'done'; })) { loadData(); }
       else { daten = {}; controlZeigen(); fsTabelle(); }
-      // Die Plakette oben rechts sagt NICHT, was dieses Geraet ist (das steht im Titel), sondern
-      // ob es schreiben DARF. Rolle 0 = nur mitlesen, kein Limit-Write moeglich.
-      el('ownrole').textContent = (st.Role >= 1) ? 'schreibberechtigt' : 'nur lesend';
-      el('ownrole').className = 'pill ' + ((st.Role >= 1) ? 'ok' : '');
       // Betriebsart: was der Treiber für DIESES Gerät verwenden würde.
       // FARBE = bewusste Entscheidung. Grün/Orange nur, wenn die Betriebsart diesem Gerät
       // ausdrücklich zugeordnet wurde (EEBusPeerMode). Die globale Vorgabe ist KEINE Aussage über
@@ -883,12 +895,7 @@
         // Ab Treiber-v149 sagt das Gerät selbst, was gilt ("Mode" + "ModeSrc"). Ältere Stände
         // kennen das nicht — dann leiten wir es hier aus dem gemeldeten Typ ab, damit die Anzeige
         // mit JEDEM Treiberstand stimmt und nicht stillschweigend das Falsche behauptet.
-        var hems;
-        if(pp.ModeSrc && (pp.Mode === 'hems' || pp.Mode === 'steuve')){
-          hems = (pp.Mode === 'hems');
-        } else {
-          hems = (pp.Type || '').toLowerCase().replace(/\s+/g, '').indexOf('energymanag') >= 0;
-        }
+        var hems = istHems(pp);
         m.textContent = hems ? 'HEMS' : 'SteuVE';
         m.className   = 'mode ' + (hems ? 'hems' : 'steuve');
         if((pp.ModeSrc || '') === 'global'){
