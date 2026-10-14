@@ -206,6 +206,7 @@
    // mit wem es verbunden war, und ein Mensch muesste jedes Mal von Hand scannen und verbinden.
 #define EEBUS_PEER_FILE         "/eebus_peer.txt"
 #define EEBUS_SHIPID_FILE       "/eebus_shipid.txt"   // optionale feste SHIP-ID (EEBusShipId)
+#define EEBUS_SMGW_FILE         "/eebus_smgw.txt"     // EEBusSmgw-Einstellung ("0", "1" oder Ziel-IPv4)
 #define EEBUS_CERT_DER_SIZE     1024
 #define EEBUS_KEY_DER_SIZE      256
 
@@ -1006,6 +1007,7 @@ bool EebusMdnsAdvertise(void) {
   Eebus.advertised = true;
   AddLog(LOG_LEVEL_INFO, PSTR("EBG: als SHIP-Dienst angekuendigt (_ship._tcp:%d, id %s, SKI %s)"),
          EEBUS_ADV_PORT, eebus_adv_id, Eebus.own_ski);
+  EebusSmgwAliasApply();   // smgw.local fuer den Zeitabruf des ERC (EEBusSmgw)
   return true;
 }
 
@@ -2212,13 +2214,16 @@ bool eebus_omit_destdev = false;
 // Frage war, ob der ERC seine Uhr daraus stellt (er bietet kein TimeInformation-Feature an).
 // Standard aus: strenge Gegenstellen sollen nichts Neues sehen, solange nicht getestet wird.
 uint8_t eebus_hdr_time = 0;
-// Test (EEBusSmgw 1): zusaetzlich auf mDNS "smgw.local" antworten (mit unserer IPv4). Der Weidmueller
-// ERC sucht beim Start per mDNS genau diesen Namen — im PPC-Verbund das Smart Meter Gateway plus, von
-// dem er ueber den CLS-Kanal die Uhrzeit holt (PPCCLS_TIMESYNC). Ohne Antwort versucht er es mit einem
-// Platzhalter (ARP nach 255.2.0.0) und meldet "could not connect to peer". Mit dem Alias sehen wir im
-// Mitschnitt, auf welchem Port und mit welchem Protokoll er anklopft. Standard aus.
-uint8_t eebus_smgw_alias = 0;
+// Zeitdienst fuer den Weidmueller ERC (EEBusSmgw). Der ERC sucht beim Start per mDNS "smgw.local" —
+// im PPC-Verbund das Smart Meter Gateway plus — und holt dort die Uhrzeit (PPCCLS_TIMESYNC): TLS 1.2
+// auf TCP 4460, darin ein normales 48-Byte-NTP-Clientpaket; das Server-Zertifikat prueft er nicht.
+// Ohne Antwort versucht er es mit einem Platzhalter (ARP nach 255.2.0.0), meldet "could not connect
+// to peer" und seine Uhr steht auf 1970. Wir beantworten smgw.local und den Zeitabruf selbst.
+// 1 = Alias auf uns + Zeitdienst (Standard), 0 = aus, IPv4 = Alias auf ein anderes Geraet (ohne
+// eigenen Zeitdienst). Gespeichert in EEBUS_SMGW_FILE.
+uint8_t eebus_smgw_alias = 1;
 uint32_t eebus_smgw_ip = 0;   // Zieladresse des Alias; 0 = unsere eigene IPv4 (EEBusSmgw <a.b.c.d>)
+uint32_t eebus_time_served = 0;   // erfolgreiche Abrufe seit dem Start (EEBusSmgw zeigt sie an)
 // dst_ent_list (optional): Ziel-Entity als fertige LISTE, z.B. "6,1" fuer eine Untereinheit.
 // Warum: eine Entity-Adresse ist nach SPINE eine LISTE, nicht eine Zahl — eine Batterie IN einem
 // Speicher hat die Adresse [6,1]. Mit nur einem int war sie nicht adressierbar; ein Read an [6]
@@ -4634,7 +4639,24 @@ void EebusAutoConnectRun(void) {
 // EEBusAutoConn <sekunden> Wartezeit nach Netz+Uhr, bevor selbsttaetig gesucht wird (0 = aus)
 // EEBusAutoConn -1         gemerkten Peer vergessen (kein Wiederaufbau mehr)
 // mDNS-Alias "smgw" setzen/entfernen (s. eebus_smgw_alias). Rueckgabe: Alias ist jetzt aktiv.
+// Gespeicherte EEBusSmgw-Einstellung einmalig laden (fehlt die Datei, gilt der Standard).
+void EebusSmgwLoad(void) {
+  static bool loaded = false;
+  if (loaded) { return; }
+  loaded = true;
+  if (!TfsFileExists(EEBUS_SMGW_FILE)) { return; }
+  char v[20] = { 0 };
+  File f = ffsp->open(EEBUS_SMGW_FILE, "r");
+  if (!f) { return; }
+  f.read((uint8_t*)v, sizeof(v) - 1);
+  f.close();
+  IPAddress tip;
+  if (strchr(v, '.') && tip.fromString(v)) { eebus_smgw_alias = 1; eebus_smgw_ip = (uint32_t)tip; }
+  else { eebus_smgw_alias = ('0' == v[0]) ? 0 : 1; eebus_smgw_ip = 0; }
+}
+
 bool EebusSmgwAliasApply(void) {
+  EebusSmgwLoad();
   if (!Eebus.mdns_ready) { return false; }
   bool exists = mdns_hostname_exists("smgw");
   if (!eebus_smgw_alias) {
@@ -4660,9 +4682,9 @@ bool EebusSmgwAliasApply(void) {
   return true;
 }
 
-// EEBusSmgw 0|1|<a.b.c.d> — Test: auf mDNS "smgw.local" antworten (s. eebus_smgw_alias).
-// Mit Adresse zeigt der Name auf ein anderes Geraet (z.B. einen NTS-Zeitserver), 1 = auf uns.
+// EEBusSmgw 0|1|<a.b.c.d> — Zeitdienst fuer den ERC (s. eebus_smgw_alias). Wird gespeichert.
 void CmndEebusSmgw(void) {
+  EebusSmgwLoad();
   IPAddress tip;
   if ((XdrvMailbox.data_len > 0) && strchr(XdrvMailbox.data, '.') && tip.fromString(XdrvMailbox.data)) {
     eebus_smgw_ip = (uint32_t)tip;
@@ -4671,9 +4693,18 @@ void CmndEebusSmgw(void) {
     eebus_smgw_alias = (uint8_t)XdrvMailbox.payload;
     if (1 == XdrvMailbox.payload) { eebus_smgw_ip = 0; }
   }
+  if (XdrvMailbox.data_len > 0) {
+    char v[20];
+    if (eebus_smgw_alias && eebus_smgw_ip) { strlcpy(v, IPAddress(eebus_smgw_ip).toString().c_str(), sizeof(v)); }
+    else { strlcpy(v, eebus_smgw_alias ? "1" : "0", sizeof(v)); }
+    TfsSaveFile(EEBUS_SMGW_FILE, (const uint8_t*)v, strlen(v));
+  }
   bool on = EebusSmgwAliasApply();
-  Response_P(PSTR("{\"%s\":{\"Smgw\":%d,\"Ziel\":\"%s\",\"Aktiv\":%s}}"), XdrvMailbox.command, eebus_smgw_alias,
-             eebus_smgw_ip ? IPAddress(eebus_smgw_ip).toString().c_str() : "eigene", on ? "true" : "false");
+  Response_P(PSTR("{\"%s\":{\"Smgw\":%d,\"Ziel\":\"%s\",\"Aktiv\":%s,\"Zeitdienst\":%s,\"UhrGueltig\":%s,\"Abrufe\":%u}}"),
+             XdrvMailbox.command, eebus_smgw_alias,
+             eebus_smgw_ip ? IPAddress(eebus_smgw_ip).toString().c_str() : "eigene", on ? "true" : "false",
+             (eebus_smgw_alias && !eebus_smgw_ip) ? "true" : "false", RtcTime.valid ? "true" : "false",
+             eebus_time_served);
 }
 
 // EEBusHdrTime 0|1 — Test: UTC-Zeitstempel im SPINE-Header jedes Datagramms (s. eebus_hdr_time).
@@ -6974,12 +7005,147 @@ void EebusInboundAccept(void) {
   }
 }
 
+/*********************************************************************************************\
+ * Zeitdienst fuer den Weidmueller ERC (smgw.local, TLS 1.2 auf TCP 4460, NTP-Paket im Tunnel)
+ * Nutzt den BearSSL-Servercode der SHIP-Slots ueber einen eigenen Slot (ESrv zeigt waehrenddessen
+ * darauf). Ein Abruf = Handshake, 48 Byte rein, 48 Byte raus, Verbindung zu.
+\*********************************************************************************************/
+
+#define EEBUS_TIME_PORT  4460
+#define NTP_UNIX_DELTA   2208988800UL
+NetworkServer *EebusTimeListen = nullptr;
+EebusSrvSlot ETimeSlot;
+uint8_t  eebus_time_rx[48];
+uint8_t  eebus_time_rxlen = 0;
+bool     eebus_time_sent = false;
+
+// 64-bit-NTP-Zeitstempel (Sekunden seit 1900 + Bruchteil) fuer jetzt.
+void EebusNtpNow(uint8_t *out) {
+  uint32_t sec  = UtcTime() + NTP_UNIX_DELTA;
+  uint32_t frac = (uint32_t)(((uint64_t)RtcMillis() << 32) / 1000);
+  out[0] = sec >> 24;  out[1] = sec >> 16;  out[2] = sec >> 8;  out[3] = sec;
+  out[4] = frac >> 24; out[5] = frac >> 16; out[6] = frac >> 8; out[7] = frac;
+}
+
+// Pumpe des Zeit-Slots (ESrv zeigt auf ETimeSlot). Gibt den Slot frei, wenn der Abruf erledigt ist.
+void EebusTimePoll(void) {
+  br_ssl_engine_context *eng = &ESrv.sc->eng;
+  if ((!ESrv.sock.connected() && (0 == ESrv.sock.available())) || TimeReached(ESrv.deadline)) {
+    if (!eebus_time_sent) {
+      AddLog(LOG_LEVEL_INFO, PSTR("EBG: Zeitabruf von %s ohne Ergebnis beendet (%u Byte erhalten)"),
+             ESrv.peer_ip, eebus_time_rxlen);
+    }
+    EebusSrvFree();
+    return;
+  }
+  for (int guard = 0; guard < 50; guard++) {
+    unsigned state = br_ssl_engine_current_state(eng);
+    if (state & BR_SSL_CLOSED) { EebusSrvFree(); return; }
+    if (state & BR_SSL_SENDREC) {
+      size_t len;
+      unsigned char *buf = br_ssl_engine_sendrec_buf(eng, &len);
+      int wlen = ESrv.sock.write(buf, len);
+      if (wlen > 0) { br_ssl_engine_sendrec_ack(eng, wlen); continue; }
+      return;
+    }
+    if (state & BR_SSL_RECVAPP) {
+      size_t len;
+      unsigned char *buf = br_ssl_engine_recvapp_buf(eng, &len);
+      size_t take = 48 - eebus_time_rxlen;
+      if (take > len) { take = len; }
+      memcpy(eebus_time_rx + eebus_time_rxlen, buf, take);
+      eebus_time_rxlen += take;
+      br_ssl_engine_recvapp_ack(eng, len);   // Ueberschuss verwerfen
+      if ((48 == eebus_time_rxlen) && !eebus_time_sent) {
+   // Antwort wie ein NTP-Server: Modus 4, Version wie die Anfrage, Stratum 3 (wir stellen uns per NTP),
+   // Ursprungszeit = Sendezeit des Clients, Empfangs-/Sendezeit = jetzt.
+        uint8_t r[48];
+        memset(r, 0, sizeof(r));
+        uint8_t vn = (eebus_time_rx[0] >> 3) & 7;
+        r[0] = (uint8_t)((vn << 3) | 4);
+        r[1] = 3;
+        r[2] = eebus_time_rx[2];
+        r[3] = (uint8_t)-10;   // Genauigkeit ~1 ms
+        r[11] = 0x10;          // Root Dispersion ~ 1/16 s
+        EebusNtpNow(r + 16);   // Referenzzeit
+        memcpy(r + 24, eebus_time_rx + 40, 8);
+        EebusNtpNow(r + 32);   // Empfangszeit
+        EebusNtpNow(r + 40);   // Sendezeit
+        eebus_time_sent = EebusSrvAppWrite(r, sizeof(r));
+        if (eebus_time_sent) {
+          eebus_time_served++;
+          AddLog(LOG_LEVEL_INFO, PSTR("EBG: Zeitabruf von %s beantwortet (NTP v%u, %s UTC)"),
+                 ESrv.peer_ip, vn, GetDT(UtcTime()).c_str());
+          br_ssl_engine_close(eng);   // close_notify — die Pumpe sendet ihn, dann CLOSED
+          ESrv.deadline = millis() + 3000;
+        }
+      }
+      continue;
+    }
+    if (state & BR_SSL_RECVREC) {
+      if (ESrv.sock.available() > 0) {
+        size_t len;
+        unsigned char *buf = br_ssl_engine_recvrec_buf(eng, &len);
+        int rlen = ESrv.sock.read(buf, len);
+        if (rlen > 0) { br_ssl_engine_recvrec_ack(eng, rlen); continue; }
+      }
+      return;
+    }
+    br_ssl_engine_flush(eng, 0);
+    return;
+  }
+}
+
+// Alle 100 ms: Listener auf 4460 halten, Abrufe annehmen und abarbeiten.
+void EebusTimeServe(void) {
+  EebusSmgwLoad();
+  bool want = eebus_smgw_alias && (0 == eebus_smgw_ip);
+  EebusSrvSlot *keep = ESrvP;
+  if (!want) {
+    if (ETimeSlot.active) { ESrvP = &ETimeSlot; EebusSrvFree(); ESrvP = keep; }
+    if (EebusTimeListen) { EebusTimeListen->end(); delete EebusTimeListen; EebusTimeListen = nullptr; }
+    return;
+  }
+  if (nullptr == EebusTimeListen) {
+    if (!WifiHasIP() && (0 == (uint32_t)EthernetLocalIP())) { return; }
+    EebusTimeListen = new NetworkServer(EEBUS_TIME_PORT);
+    EebusTimeListen->begin();
+    AddLog(LOG_LEVEL_INFO, PSTR("EBG: Zeitdienst fuer smgw.local lauscht auf Port %d"), EEBUS_TIME_PORT);
+  }
+  NetworkClient c = EebusTimeListen->accept();
+  if (c) {
+    IPAddress rip = c.remoteIP();
+    if (ETimeSlot.active) {
+      AddLog(LOG_LEVEL_INFO, PSTR("EBG: Zeitabruf von %s abgewiesen (laeuft schon)"), rip.toString().c_str());
+      c.stop();
+    } else if (!RtcTime.valid) {   // ohne gueltige eigene Uhr keine Zeit ausliefern
+      AddLog(LOG_LEVEL_INFO, PSTR("EBG: Zeitabruf von %s abgewiesen (eigene Uhr noch nicht gestellt)"), rip.toString().c_str());
+      c.stop();
+    } else {
+      ESrvP = &ETimeSlot;
+      EebusSrvFree();
+      ESrv.sock = c;
+      strlcpy(ESrv.peer_ip, rip.toString().c_str(), sizeof(ESrv.peer_ip));
+      eebus_time_rxlen = 0;
+      eebus_time_sent = false;
+      if (!EebusSrvStart()) { EebusSrvFree(); }
+      ESrvP = keep;
+    }
+  }
+  if (ETimeSlot.active) {
+    ESrvP = &ETimeSlot;
+    EebusTimePoll();
+    ESrvP = keep;
+  }
+}
+
 bool Xdrv126(uint32_t function) {
   bool result = false;
 
   switch (function) {
     case FUNC_EVERY_100_MSECOND:
       EebusInboundAccept();   // SHIP-Server Etappe 1 (TLS-Server-Handshake)
+      EebusTimeServe();   // Zeitdienst fuer den ERC (smgw.local:4460)
       if (Eebus.scan) { EebusPollScan(); }
       for (int ci = 0; ci < EEBUS_MAX_CONN; ci++) {   // M2b: SME-Handshake + RX je Slot
         ESp = &EConn[ci];
