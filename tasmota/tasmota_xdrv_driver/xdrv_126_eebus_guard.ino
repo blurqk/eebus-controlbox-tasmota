@@ -250,7 +250,7 @@ extern FS *ufsp;   // aktives FS (SD-Karte wenn gemountet) — fuer den SHIP-Mit
 const char kEebusCommands[] PROGMEM = D_PRFX_EEBUS "|"   // Prefix
   "Scan|Peers|Cert|Connect|Disconnect|Status|Trust|ConnectIp|Advertise|Log|"
   "Role|Lpc|ReleaseAll|Release|Target|Probe|Provide|Open|Hems|PeerMode|DelDur|"
-  "LppFrei|Lpp|Anmeld|Data|Mess|Struct|Read|AutoConn|Pair|ShipId|Failsafe";   // ReleaseAll VOR Release, LppFrei VOR Lpp (Praefix-Match!)
+  "LppFrei|Lpp|Anmeld|Data|Mess|Struct|Read|AutoConn|Pair|ShipId|Failsafe|HdrTime|Smgw";   // ReleaseAll VOR Release, LppFrei VOR Lpp (Praefix-Match!)
 
 uint32_t EebusRetryMs(void);   // Abstand bis zum naechsten Verbindungsversuch (s. Pairing-Abschnitt)
 
@@ -262,7 +262,8 @@ void (* const EebusCommand[])(void) PROGMEM = {
   &CmndEebusTarget, &CmndEebusProbe, &CmndEebusProvide, &CmndEebusOpen, &CmndEebusHems,
   &CmndEebusPeerMode, &CmndEebusDelDur,
   &CmndEebusLppFrei, &CmndEebusLpp, &CmndEebusAnmeld, &CmndEebusData,
-  &CmndEebusMess, &CmndEebusStruct, &CmndEebusRead, &CmndEebusAutoConn, &CmndEebusPair, &CmndEebusShipId, &CmndEebusFailsafe };
+  &CmndEebusMess, &CmndEebusStruct, &CmndEebusRead, &CmndEebusAutoConn, &CmndEebusPair, &CmndEebusShipId, &CmndEebusFailsafe,
+  &CmndEebusHdrTime, &CmndEebusSmgw };
 
 // Blind-Adressierung (Waermepumpen-Gateway liefert ihre Discovery nicht — VR940-Karte als Vorlage:
 // LoadControl/server auf entity 3 "HeatPumpAppliance"):
@@ -2207,6 +2208,17 @@ void EebusSmeStart(void) {
 // wenn true, wird beim naechsten Send KEINE Ziel-device-Adresse gesetzt (nur fuer den
 // DetailedDiscovery-Read noetig — s.u.). Wird direkt nach dem Send wieder zurueckgesetzt.
 bool eebus_omit_destdev = false;
+// Test (EEBusHdrTime 1): optionales SPINE-Header-Element "timestamp" (UTC) in JEDES Datagramm.
+// Frage war, ob der ERC seine Uhr daraus stellt (er bietet kein TimeInformation-Feature an).
+// Standard aus: strenge Gegenstellen sollen nichts Neues sehen, solange nicht getestet wird.
+uint8_t eebus_hdr_time = 0;
+// Test (EEBusSmgw 1): zusaetzlich auf mDNS "smgw.local" antworten (mit unserer IPv4). Der Weidmueller
+// ERC sucht beim Start per mDNS genau diesen Namen — im PPC-Verbund das Smart Meter Gateway plus, von
+// dem er ueber den CLS-Kanal die Uhrzeit holt (PPCCLS_TIMESYNC). Ohne Antwort versucht er es mit einem
+// Platzhalter (ARP nach 255.2.0.0) und meldet "could not connect to peer". Mit dem Alias sehen wir im
+// Mitschnitt, auf welchem Port und mit welchem Protokoll er anklopft. Standard aus.
+uint8_t eebus_smgw_alias = 0;
+uint32_t eebus_smgw_ip = 0;   // Zieladresse des Alias; 0 = unsere eigene IPv4 (EEBusSmgw <a.b.c.d>)
 // dst_ent_list (optional): Ziel-Entity als fertige LISTE, z.B. "6,1" fuer eine Untereinheit.
 // Warum: eine Entity-Adresse ist nach SPINE eine LISTE, nicht eine Zahl — eine Batterie IN einem
 // Speicher hat die Adresse [6,1]. Mit nur einem int war sie nicht adressierbar; ein Read an [6]
@@ -2246,6 +2258,11 @@ void EebusSpineSendAddr(const char *cmd_classifier, bool has_ref, uint32_t ref, 
   const char *ack = (has_ref
                      || (0 == strcmp(cmd_classifier, "notify"))
                      || (0 == strcmp(cmd_classifier, "read"))) ? "" : ",{\"ackRequest\":true}";
+   // timestamp steht im SPINE-HeaderType hinter ackRequest (letztes Element). Nur mit gueltiger Uhr.
+  char ts_frag[40]; ts_frag[0] = '\0';
+  if (eebus_hdr_time && RtcTime.valid) {
+    snprintf(ts_frag, sizeof(ts_frag), ",{\"timestamp\":\"%sZ\"}", GetDT(UtcTime()).c_str());
+  }
 
    // Ziel-Entity: fertige Liste, wenn eine mitgegeben wurde, sonst die einzelne Zahl.
   char dst_ent_txt[24];
@@ -2261,9 +2278,10 @@ void EebusSpineSendAddr(const char *cmd_classifier, bool has_ref, uint32_t ref, 
     "%s"   // ref_frag (msgCounterReference) VOR cmdClassifier
     "{\"cmdClassifier\":\"%s\"}"
     "%s"   // ackRequest NACH cmdClassifier (SPINE-Reihenfolge, wie Vergleichs-Steuerbox)
+    "%s"   // timestamp (nur EEBusHdrTime 1)
     "]},{\"payload\":[{\"cmd\":[[%s]]}]}]}}]}",
     EEBUS_SPINE_VERSION, own, src_ent, src_feat, dest_dev, dst_ent_txt, dst_feat,
-    ESp->spine_ctr++, ref_frag, cmd_classifier, ack, cmd_json);
+    ESp->spine_ctr++, ref_frag, cmd_classifier, ack, ts_frag, cmd_json);
 
   EebusHeapCheckN("spine_format", (uint32_t)strlen(buf));   // nach snprintf ins Datagramm
   EebusShipSendJson(buf, 2);
@@ -4615,6 +4633,58 @@ void EebusAutoConnectRun(void) {
 // EEBusAutoConn            Zustand anzeigen
 // EEBusAutoConn <sekunden> Wartezeit nach Netz+Uhr, bevor selbsttaetig gesucht wird (0 = aus)
 // EEBusAutoConn -1         gemerkten Peer vergessen (kein Wiederaufbau mehr)
+// mDNS-Alias "smgw" setzen/entfernen (s. eebus_smgw_alias). Rueckgabe: Alias ist jetzt aktiv.
+bool EebusSmgwAliasApply(void) {
+  if (!Eebus.mdns_ready) { return false; }
+  bool exists = mdns_hostname_exists("smgw");
+  if (!eebus_smgw_alias) {
+    if (exists) { mdns_delegate_hostname_remove("smgw"); }
+    return false;
+  }
+  uint32_t ip = eebus_smgw_ip;   // feste Zieladresse (z.B. ein NTS-Server), sonst wir selbst
+  if (0 == ip) { ip = (uint32_t)WiFi.localIP(); }
+  if (0 == ip) { ip = (uint32_t)EthernetLocalIP(); }
+  if (0 == ip) { return false; }
+  mdns_ip_addr_t a;
+  memset(&a, 0, sizeof(a));
+  a.addr.type = ESP_IPADDR_TYPE_V4;
+  a.addr.u_addr.ip4.addr = ip;
+  a.next = nullptr;
+  esp_err_t err = exists ? mdns_delegate_hostname_set_address("smgw", &a)
+                         : mdns_delegate_hostname_add("smgw", &a);
+  if (ESP_OK != err) {
+    AddLog(LOG_LEVEL_INFO, PSTR("EBG: mDNS-Alias smgw.local fehlgeschlagen (%d)"), err);
+    return false;
+  }
+  AddLog(LOG_LEVEL_INFO, PSTR("EBG: mDNS-Alias smgw.local -> %s aktiv"), IPAddress(ip).toString().c_str());
+  return true;
+}
+
+// EEBusSmgw 0|1|<a.b.c.d> — Test: auf mDNS "smgw.local" antworten (s. eebus_smgw_alias).
+// Mit Adresse zeigt der Name auf ein anderes Geraet (z.B. einen NTS-Zeitserver), 1 = auf uns.
+void CmndEebusSmgw(void) {
+  IPAddress tip;
+  if ((XdrvMailbox.data_len > 0) && strchr(XdrvMailbox.data, '.') && tip.fromString(XdrvMailbox.data)) {
+    eebus_smgw_ip = (uint32_t)tip;
+    eebus_smgw_alias = 1;
+  } else if ((XdrvMailbox.data_len > 0) && (XdrvMailbox.payload >= 0) && (XdrvMailbox.payload <= 1)) {
+    eebus_smgw_alias = (uint8_t)XdrvMailbox.payload;
+    if (1 == XdrvMailbox.payload) { eebus_smgw_ip = 0; }
+  }
+  bool on = EebusSmgwAliasApply();
+  Response_P(PSTR("{\"%s\":{\"Smgw\":%d,\"Ziel\":\"%s\",\"Aktiv\":%s}}"), XdrvMailbox.command, eebus_smgw_alias,
+             eebus_smgw_ip ? IPAddress(eebus_smgw_ip).toString().c_str() : "eigene", on ? "true" : "false");
+}
+
+// EEBusHdrTime 0|1 — Test: UTC-Zeitstempel im SPINE-Header jedes Datagramms (s. eebus_hdr_time).
+void CmndEebusHdrTime(void) {
+  if ((XdrvMailbox.data_len > 0) && (XdrvMailbox.payload >= 0) && (XdrvMailbox.payload <= 1)) {
+    eebus_hdr_time = (uint8_t)XdrvMailbox.payload;
+  }
+  Response_P(PSTR("{\"%s\":{\"HdrTime\":%d,\"UhrGueltig\":%s}}"), XdrvMailbox.command, eebus_hdr_time,
+             RtcTime.valid ? "true" : "false");
+}
+
 void CmndEebusAutoConn(void) {
   if (XdrvMailbox.data_len > 0) {
     long v = atol(XdrvMailbox.data);
