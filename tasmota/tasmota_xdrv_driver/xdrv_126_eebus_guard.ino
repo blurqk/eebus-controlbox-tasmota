@@ -2224,6 +2224,12 @@ uint8_t eebus_hdr_time = 0;
 uint8_t eebus_smgw_alias = 1;
 uint32_t eebus_smgw_ip = 0;   // Zieladresse des Alias; 0 = unsere eigene IPv4 (EEBusSmgw <a.b.c.d>)
 uint32_t eebus_time_served = 0;   // erfolgreiche Abrufe seit dem Start (EEBusSmgw zeigt sie an)
+// Zeitpunkte (UTC) fuer EEBusSmgw: Weidmueller nennt einen Abruf alle 24 h — das soll nachpruefbar sein,
+// ohne Syslog. Nur im Arbeitsspeicher, nach einem Neustart wieder 0.
+uint32_t eebus_time_last = 0;     // letzter beantworteter Abruf
+uint32_t eebus_time_prev = 0;     // der davor (Abstand = last - prev)
+uint32_t eebus_time_failed = 0;   // Abrufe ohne Ergebnis oder abgewiesen
+uint32_t eebus_time_failed_at = 0;
 // dst_ent_list (optional): Ziel-Entity als fertige LISTE, z.B. "6,1" fuer eine Untereinheit.
 // Warum: eine Entity-Adresse ist nach SPINE eine LISTE, nicht eine Zahl — eine Batterie IN einem
 // Speicher hat die Adresse [6,1]. Mit nur einem int war sie nicht adressierbar; ein Read an [6]
@@ -4700,11 +4706,16 @@ void CmndEebusSmgw(void) {
     TfsSaveFile(EEBUS_SMGW_FILE, (const uint8_t*)v, strlen(v));
   }
   bool on = EebusSmgwAliasApply();
-  Response_P(PSTR("{\"%s\":{\"Smgw\":%d,\"Ziel\":\"%s\",\"Aktiv\":%s,\"Zeitdienst\":%s,\"UhrGueltig\":%s,\"Abrufe\":%u}}"),
+  // Zeitpunkte als ISO-UTC mit "Z", leer wenn noch keiner; Abstand im Tasmota-Format 1T00:00:12
+  String last = eebus_time_last ? GetDT(eebus_time_last) + "Z" : "";
+  String gap = (eebus_time_last && eebus_time_prev) ? GetDuration(eebus_time_last - eebus_time_prev) : "";
+  String fail = eebus_time_failed_at ? GetDT(eebus_time_failed_at) + "Z" : "";
+  Response_P(PSTR("{\"%s\":{\"Smgw\":%d,\"Ziel\":\"%s\",\"Aktiv\":%s,\"Zeitdienst\":%s,\"UhrGueltig\":%s,\"Abrufe\":%u,"
+                  "\"LetzterAbruf\":\"%s\",\"Abstand\":\"%s\",\"Fehlversuche\":%u,\"LetzterFehlversuch\":\"%s\"}}"),
              XdrvMailbox.command, eebus_smgw_alias,
              eebus_smgw_ip ? IPAddress(eebus_smgw_ip).toString().c_str() : "eigene", on ? "true" : "false",
              (eebus_smgw_alias && !eebus_smgw_ip) ? "true" : "false", RtcTime.valid ? "true" : "false",
-             eebus_time_served);
+             eebus_time_served, last.c_str(), gap.c_str(), eebus_time_failed, fail.c_str());
 }
 
 // EEBusHdrTime 0|1 — Test: UTC-Zeitstempel im SPINE-Header jedes Datagramms (s. eebus_hdr_time).
@@ -7034,6 +7045,8 @@ void EebusTimePoll(void) {
     if (!eebus_time_sent) {
       AddLog(LOG_LEVEL_INFO, PSTR("EBG: Zeitabruf von %s ohne Ergebnis beendet (%u Byte erhalten)"),
              ESrv.peer_ip, eebus_time_rxlen);
+      eebus_time_failed++;
+      eebus_time_failed_at = UtcTime();
     }
     EebusSrvFree();
     return;
@@ -7074,6 +7087,8 @@ void EebusTimePoll(void) {
         eebus_time_sent = EebusSrvAppWrite(r, sizeof(r));
         if (eebus_time_sent) {
           eebus_time_served++;
+          eebus_time_prev = eebus_time_last;
+          eebus_time_last = UtcTime();
           AddLog(LOG_LEVEL_INFO, PSTR("EBG: Zeitabruf von %s beantwortet (NTP v%u, %s UTC)"),
                  ESrv.peer_ip, vn, GetDT(UtcTime()).c_str());
           br_ssl_engine_close(eng);   // close_notify — die Pumpe sendet ihn, dann CLOSED
@@ -7118,9 +7133,12 @@ void EebusTimeServe(void) {
     if (ETimeSlot.active) {
       AddLog(LOG_LEVEL_INFO, PSTR("EBG: Zeitabruf von %s abgewiesen (laeuft schon)"), rip.toString().c_str());
       c.stop();
+      eebus_time_failed++;
+      eebus_time_failed_at = UtcTime();
     } else if (!RtcTime.valid) {   // ohne gueltige eigene Uhr keine Zeit ausliefern
       AddLog(LOG_LEVEL_INFO, PSTR("EBG: Zeitabruf von %s abgewiesen (eigene Uhr noch nicht gestellt)"), rip.toString().c_str());
       c.stop();
+      eebus_time_failed++;   // ohne Zeitstempel: die eigene Uhr ist ja noch nicht gestellt
     } else {
       ESrvP = &ETimeSlot;
       EebusSrvFree();

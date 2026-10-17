@@ -330,6 +330,20 @@
     </div>
   </div>
 
+  <!-- ===== ZEITDIENST FUER DEN ERC (EEBusSmgw) =====
+       Der Weidmueller ERC holt seine Uhrzeit bei smgw.local — laut Weidmueller beim Start und dann alle
+       24 h. Die Zeitpunkte liegen nur im Arbeitsspeicher der Steuerbox und sind nach einem Neustart weg. -->
+  <div class="card" data-page="connection">
+    <h2>Zeitdienst für den ERC</h2>
+    <div class="ident">
+      <b>Zustand</b><span id="smgw_state">—</span>
+      <b>Abrufe</b><span id="smgw_count">—</span>
+      <b>Letzter Abruf</b><span id="smgw_last">—</span>
+      <b>Abstand</b><span id="smgw_gap">—</span>
+      <b>Fehlversuche</b><span id="smgw_fail">—</span>
+    </div>
+  </div>
+
   <!-- ===== ZIEL DER BEFEHLE (Control) =====
        Vorgabe "Alle": jeder Befehl geht einzeln an jedes verbundene Geraet. Die Auswahl ist unabhaengig
        von der Geraetewahl auf der Connection-Seite und wird im Browser gemerkt. -->
@@ -1637,6 +1651,19 @@
       setTimeout(pairLaden, 25000); setTimeout(refresh, 30000); setTimeout(pairLaden, 60000);
     });
   }
+  // --- Zeitdienst fuer den ERC (EEBusSmgw) -------------------------------------------------------
+  function smgwZeit(t){ return t ? new Date(t).toLocaleString() : '—'; }
+  function smgwLaden(){
+    cmd('EEBusSmgw').then(function(j){
+      var z = j && j.EEBusSmgw; if(!z) return;
+      el('smgw_state').textContent = !z.Zeitdienst ? 'aus' + (z.Smgw ? ' (smgw.local zeigt auf ' + z.Ziel + ')' : '')
+        : (z.UhrGueltig ? 'aktiv' : 'aktiv, eigene Uhr noch nicht gestellt');
+      el('smgw_count').textContent = z.Abrufe + ' seit dem Start';
+      el('smgw_last').textContent  = smgwZeit(z.LetzterAbruf);
+      el('smgw_gap').textContent   = z.Abstand ? z.Abstand.replace('T', ' Tag(e) ') + ' zum vorigen' : '—';
+      el('smgw_fail').textContent  = z.Fehlversuche ? z.Fehlversuche + ', zuletzt ' + smgwZeit(z.LetzterFehlversuch) : 'keine';
+    });
+  }
   function pairStop(){ cmd('EEBusPair 0').then(function(j){ pairZeigen(j); say(JSON.stringify(j)); }); }
 
   // --- Ziele der Control-Seite --------------------------------------------------------------------
@@ -1978,10 +2005,11 @@
   seite(location.hash.substring(1));
   window.addEventListener('hashchange', function(){ seite(location.hash.substring(1)); });
   pairLaden();
+  smgwLaden();
   ledCfgZeigen();
   ausgaengeZeigen();
   el('pv_wp').addEventListener('input', ausgaengeZeigen);
-  setInterval(function(){ if(!document.hidden){ refresh(); pairLaden(); } }, 20000);
+  setInterval(function(){ if(!document.hidden){ refresh(); pairLaden(); smgwLaden(); } }, 20000);
 </script>
 </body>
 </html>
